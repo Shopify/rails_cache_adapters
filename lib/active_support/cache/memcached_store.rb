@@ -13,58 +13,23 @@ module ActiveSupport
     class MemcachedStore < Store
       ESCAPE_KEY_CHARS = /[\x00-\x20%\x7F-\xFF]/n
 
-      class Codec
-        # use dalli compatible flags
-        SERIALIZED_FLAG = 0x1
-        COMPRESSED_FLAG = 0x2
+      attr_accessor :swallow_exceptions
 
-        # Older versions of this gem would use 0 for the flags whether or not
-        # the value was marshal dumped. By setting this flag, we can tell if
-        # it were set with an older version for backwards compatible decoding.
-        RAW_FLAG = 0x10
-
-        def initialize(serializer: Marshal, compressor: nil)
-          @serializer = serializer
-          @compressor = compressor
-        end
-
-        def encode(_key, value, flags)
-          unless value.is_a?(String)
-            flags |= SERIALIZED_FLAG
-            value = @serializer.dump(value)
-          end
-          if @compressor
-            flags |= COMPRESSED_FLAG
-            value = @compressor.compress(value)
-          end
-          flags |= RAW_FLAG if flags == 0
+      module RawCodec
+        def self.encode(_key, value, flags)
           [value, flags]
         end
 
-        def decode(_key, value, flags)
-          if (flags & COMPRESSED_FLAG) != 0
-            value = @compressor.decompress(value)
-          end
-
-          if (flags & SERIALIZED_FLAG) != 0
-            @serializer.load(value)
-          elsif flags == 0 # legacy cache value
-            @serializer.load(value) rescue value
-          else
-            value
-          end
+        def self.decode(_key, value, _flags)
+          value
         end
       end
-
-      attr_accessor :read_only, :swallow_exceptions
 
       prepend(Strategy::LocalCache)
 
       def initialize(*addresses, **options)
         addresses = addresses.flatten
-        options[:codec] ||= Codec.new
-        @swallow_exceptions = true
-        @swallow_exceptions = options.delete(:swallow_exceptions) if options.key?(:swallow_exceptions)
+        options[:codec] ||= RawCodec
 
         super(options)
 
@@ -81,7 +46,6 @@ module ActiveSupport
       end
 
       def append(name, value, options = nil)
-        return true if read_only
         options = merged_options(options)
         normalized_key = normalize_key(name, options)
 
@@ -91,16 +55,6 @@ module ActiveSupport
           end
           true
         end
-      end
-
-      def write(*)
-        return true if read_only
-        super
-      end
-
-      def delete(*)
-        return true if read_only
-        super
       end
 
       def read_multi(*names)
@@ -115,7 +69,7 @@ module ActiveSupport
           instrument(:read_multi, names, options) do
             if raw_values = @connection.get(keys_to_names.keys)
               raw_values.each do |key, value|
-                entry = deserialize_entry(value)
+                entry = deserialize_entry(value, **options)
                 values[keys_to_names[key]] = entry.value unless entry.expired?
               end
             end
@@ -133,8 +87,7 @@ module ActiveSupport
             @connection.cas(key, expiration(options)) do |raw_value|
               entry = deserialize_entry(raw_value)
               value = yield entry.value
-              break true if read_only
-              serialize_entry(Entry.new(value, **options), options)
+              serialize_entry(Entry.new(value, **options), **options)
             end
           end
           true
@@ -159,10 +112,8 @@ module ActiveSupport
 
               values = yield values
 
-              break true if read_only
-
               serialized_values = values.map do |name, value|
-                [normalize_key(name, options), serialize_entry(Entry.new(value, **options), options)]
+                [normalize_key(name, options), serialize_entry(Entry.new(value, **options), **options)]
               end
 
               Hash[serialized_values]
@@ -214,71 +165,63 @@ module ActiveSupport
 
       protected
 
-      def read_entry(key, _options) # :nodoc:
+      def read_entry(key, **options) # :nodoc:
+        deserialize_entry(read_serialized_entry(key, **options), **options)
+      end
+
+      def read_serialized_entry(key, **)
         handle_exceptions(return_value_on_error: nil) do
-          deserialize_entry(@connection.get(escape_key(key)))
+          @connection.get(key)
         end
       end
 
-      def write_entry(key, entry, options) # :nodoc:
-        return true if read_only
+      def write_entry(key, entry, **options) # :nodoc:
+        write_serialized_entry(key, serialize_entry(entry, **options), **options)
+      end
+
+      def write_serialized_entry(key, value, **options)
         method = options && options[:unless_exist] ? :add : :set
         expires_in = expiration(options)
-        value = serialize_entry(entry, options)
         handle_exceptions(return_value_on_error: false) do
-          @connection.send(method, escape_key(key), value, expires_in)
+          @connection.send(method, key, value, expires_in)
           true
         end
       end
 
       def delete_entry(key, _options) # :nodoc:
-        return true if read_only
         handle_exceptions(return_value_on_error: false, on_miss: true) do
-          @connection.delete(escape_key(key))
+          @connection.delete(key)
           true
         end
       end
 
       private
 
-      if ActiveSupport::VERSION::MAJOR < 5
-        def normalize_key(key, options)
-          escape_key(namespaced_key(key, options))
-        end
+      def normalize_key(key, options)
+        key = super.dup
+        key = key.force_encoding(Encoding::ASCII_8BIT)
+        key = key.gsub(ESCAPE_KEY_CHARS) { |match| "%#{match.getbyte(0).to_s(16).upcase}" }
+        key = "#{key[0, 213]}:md5:#{::Digest::MD5.hexdigest(key)}" if key.size > 250
+        key
+      end
 
-        def escape_key(key)
-          key = key.to_s.dup
-          key = key.force_encoding(Encoding::ASCII_8BIT)
-          key = key.gsub(ESCAPE_KEY_CHARS) { |match| "%#{match.getbyte(0).to_s(16).upcase}" }
-          key = "#{key[0, 213]}:md5:#{Digest::MD5.hexdigest(key)}" if key.size > 250
-          key
-        end
-      else
-        def normalize_key(key, options)
-          key = super.dup
-          key = key.force_encoding(Encoding::ASCII_8BIT)
-          key = key.gsub(ESCAPE_KEY_CHARS) { |match| "%#{match.getbyte(0).to_s(16).upcase}" }
-          # When we remove support to Rails 5.1 we can change the code to use ActiveSupport::Digest
-          key = "#{key[0, 213]}:md5:#{::Digest::MD5.hexdigest(key)}" if key.size > 250
-          key
-        end
-
-        def escape_key(key)
-          key
+      def deserialize_entry(payload, raw: false, **)
+        if !payload.nil? && raw
+          if payload.is_a?(Entry)
+            payload
+          else
+            Entry.new(payload, compress: false)
+          end
+        else
+          super(payload)
         end
       end
 
-      def deserialize_entry(value)
-        unless value.nil?
-          value.is_a?(Entry) ? value : Entry.new(value, compress: false)
-        end
-      end
-
-      def serialize_entry(entry, options)
-        if options[:raw]
+      def serialize_entry(entry, raw: false, **)
+        if raw
           entry.value.to_s
         else
-          entry
+          super(entry)
         end
       end
 
@@ -294,19 +237,16 @@ module ActiveSupport
         yield
       rescue Memcached::NotFound, Memcached::ConnectionDataExists, *miss_exceptions
         on_miss
+      rescue Memcached::NotStored
+        return_value_on_error
       rescue Memcached::Error => e
         log_warning(e)
-        raise unless @swallow_exceptions
         return_value_on_error
       end
 
       def log_warning(err)
-        return unless logger
-        return if err.is_a?(Memcached::NotStored) && @swallow_exceptions
-
-        logger.warn(
-          "[MEMCACHED_ERROR] swallowed=#{@swallow_exceptions}" \
-          " exception_class=#{err.class} exception_message=#{err.message}"
+        logger&.warn(
+          "[MEMCACHED_ERROR] exception_class=#{err.class} exception_message=#{err.message}"
         )
       end
 
