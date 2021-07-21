@@ -8,17 +8,12 @@ jobs:
     strategy:
       matrix:
         entry:
-          - name: 'Minimum supported'
-            ruby: '2.5'
-            gemfile: "Gemfile.min"
-          - name: 'Latest released'
+          - name: 'Ruby 2.7'
+            ruby: '2.7'
+          - name: 'Ruby 3.0'
             ruby: '3.0'
-            gemfile: "Gemfile"
 
     name: ${{ matrix.entry.name }}
-
-    env:
-      BUNDLE_GEMFILE: ${{ matrix.entry.gemfile }}
 
     services:
       memcached:
